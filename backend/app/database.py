@@ -5,8 +5,18 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict
 from contextlib import contextmanager
 import uuid
+import math
+import random
+import logging
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "monitoring.db")
+
+MIN_BEAM_LENGTH = 0.01
+MIN_SECTION_DIMENSION = 0.001
+MIN_ELASTIC_MODULUS = 1e6
+MIN_SHEAR_MODULUS = 1e5
+
+logger = logging.getLogger(__name__)
 
 
 def get_db():
@@ -21,21 +31,21 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS tenon_nodes (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        x REAL NOT NULL,
-        y REAL NOT NULL,
-        beam_length REAL NOT NULL,
-        section_width REAL NOT NULL,
-        section_height REAL NOT NULL,
-        elastic_modulus REAL NOT NULL,
-        shear_modulus REAL NOT NULL,
+        x REAL NOT NULL CHECK (x IS NOT NULL AND x == x),
+        y REAL NOT NULL CHECK (y IS NOT NULL AND y == y),
+        beam_length REAL NOT NULL CHECK (beam_length > 0 AND beam_length >= {MIN_BEAM_LENGTH}),
+        section_width REAL NOT NULL CHECK (section_width > 0 AND section_width >= {MIN_SECTION_DIMENSION}),
+        section_height REAL NOT NULL CHECK (section_height > 0 AND section_height >= {MIN_SECTION_DIMENSION}),
+        elastic_modulus REAL NOT NULL CHECK (elastic_modulus > 0 AND elastic_modulus >= {MIN_ELASTIC_MODULUS}),
+        shear_modulus REAL NOT NULL CHECK (shear_modulus > 0 AND shear_modulus >= {MIN_SHEAR_MODULUS}),
         displacement REAL DEFAULT 0,
         shear_force REAL DEFAULT 0,
         bending_moment REAL DEFAULT 0,
-        stress_level TEXT DEFAULT 'normal',
+        stress_level TEXT DEFAULT 'normal' CHECK (stress_level IN ('normal', 'warning', 'danger')),
         last_update TEXT,
         created_at TEXT DEFAULT (datetime('now'))
     )
@@ -45,9 +55,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS displacement_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         node_id TEXT NOT NULL,
-        displacement_um REAL NOT NULL,
-        shear_force_n REAL NOT NULL,
-        bending_moment_nm REAL NOT NULL,
+        displacement_um REAL NOT NULL CHECK (displacement_um IS NOT NULL AND displacement_um == displacement_um),
+        shear_force_n REAL NOT NULL CHECK (shear_force_n IS NOT NULL AND shear_force_n == shear_force_n),
+        bending_moment_nm REAL NOT NULL CHECK (bending_moment_nm IS NOT NULL AND bending_moment_nm == bending_moment_nm),
         timestamp TEXT NOT NULL,
         FOREIGN KEY (node_id) REFERENCES tenon_nodes(id)
     )
@@ -63,21 +73,21 @@ def init_db():
         id TEXT PRIMARY KEY,
         node_id TEXT NOT NULL,
         node_name TEXT NOT NULL,
-        level TEXT NOT NULL,
-        alert_type TEXT NOT NULL,
-        value REAL NOT NULL,
-        threshold REAL NOT NULL,
+        level TEXT NOT NULL CHECK (level IN ('warning', 'danger')),
+        alert_type TEXT NOT NULL CHECK (alert_type IN ('displacement', 'shear', 'moment')),
+        value REAL NOT NULL CHECK (value IS NOT NULL AND value == value),
+        threshold REAL NOT NULL CHECK (threshold > 0),
         timestamp TEXT NOT NULL,
-        acknowledged INTEGER DEFAULT 0
+        acknowledged INTEGER DEFAULT 0 CHECK (acknowledged IN (0, 1))
     )
     """)
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS alert_rules (
         node_id TEXT PRIMARY KEY,
-        displacement_threshold REAL DEFAULT 500,
-        shear_threshold REAL DEFAULT 5000,
-        moment_threshold REAL DEFAULT 2000,
+        displacement_threshold REAL DEFAULT 500 CHECK (displacement_threshold > 0),
+        shear_threshold REAL DEFAULT 5000 CHECK (shear_threshold > 0),
+        moment_threshold REAL DEFAULT 2000 CHECK (moment_threshold > 0),
         updated_at TEXT DEFAULT (datetime('now'))
     )
     """)

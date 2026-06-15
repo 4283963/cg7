@@ -3,22 +3,33 @@ import random
 import math
 from datetime import datetime
 from typing import Optional
+import logging
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
+from pydantic import ValidationError
 
 from .database import init_db
 from .models import (
     SensorData, BatchSensorData, StressResult,
-    AlertRecord, AlertRule, TopologyData, TenonNode, RealtimeUpdate
+    AlertRecord, AlertRule, TopologyData, TenonNode, RealtimeUpdate,
+    ErrorResponse
 )
 from .services import (
     NodeService, DataIngestionService, AlertService, NodeService
 )
 from .websocket_manager import ws_manager
+from .castigliano import (
+    CastiglianoCalculationError,
+    InvalidMaterialPropertyError,
+    InvalidGeometryError,
+    NumericalInstabilityError,
+)
 
+logger = logging.getLogger(__name__)
 
 _simulator_task = None
 _simulator_running = False
@@ -121,6 +132,125 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(CastiglianoCalculationError)
+async def castigliano_calculation_error_handler(
+    request: Request, exc: CastiglianoCalculationError
+) -> JSONResponse:
+    error_type = type(exc).__name__
+    detail = {
+        "error": "castigliano_calculation_error",
+        "error_type": error_type,
+        "message": str(exc),
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+        }
+    }
+    logger.error(f"Castigliano error at {request.url.path}: {str(exc)}", exc_info=True)
+
+    if isinstance(exc, NumericalInstabilityError):
+        return JSONResponse(status_code=422, content=detail)
+    elif isinstance(exc, (InvalidMaterialPropertyError, InvalidGeometryError)):
+        return JSONResponse(status_code=400, content=detail)
+    else:
+        return JSONResponse(status_code=500, content=detail)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    detail = {
+        "error": "request_validation_error",
+        "error_type": "RequestValidationError",
+        "message": "Input validation failed",
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+            "errors": exc.errors(),
+        }
+    }
+    logger.warning(f"Validation error at {request.url.path}: {exc.errors()}")
+    return JSONResponse(status_code=422, content=detail)
+
+
+@app.exception_handler(ValidationError)
+async def pydantic_validation_error_handler(
+    request: Request, exc: ValidationError
+) -> JSONResponse:
+    detail = {
+        "error": "pydantic_validation_error",
+        "error_type": "ValidationError",
+        "message": "Data validation failed",
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+            "errors": exc.errors(),
+        }
+    }
+    logger.warning(f"Pydantic validation error at {request.url.path}: {exc.errors()}")
+    return JSONResponse(status_code=422, content=detail)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request, exc: HTTPException
+) -> JSONResponse:
+    detail = {
+        "error": "http_error",
+        "error_type": f"HTTPException_{exc.status_code}",
+        "message": str(exc.detail),
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": exc.status_code,
+        }
+    }
+    logger.debug(f"HTTP {exc.status_code} at {request.url.path}: {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content=detail)
+
+
+@app.exception_handler(ZeroDivisionError)
+async def zero_division_error_handler(
+    request: Request, exc: ZeroDivisionError
+) -> JSONResponse:
+    detail = {
+        "error": "division_by_zero",
+        "error_type": "ZeroDivisionError",
+        "message": "A division by zero was prevented. This indicates invalid input parameters.",
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+            "error": str(exc),
+        }
+    }
+    logger.critical(
+        f"ZERO DIVISION ERROR at {request.url.path}: {str(exc)}",
+        exc_info=True,
+    )
+    return JSONResponse(status_code=500, content=detail)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    detail = {
+        "error": "internal_server_error",
+        "error_type": type(exc).__name__,
+        "message": "An unexpected internal error occurred. The issue has been logged.",
+        "details": {
+            "path": request.url.path,
+            "method": request.method,
+        }
+    }
+    logger.critical(
+        f"UNHANDLED EXCEPTION at {request.url.path}: {str(exc)}",
+        exc_info=True,
+    )
+    return JSONResponse(status_code=500, content=detail)
 
 
 @app.get("/api/health")

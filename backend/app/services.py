@@ -2,13 +2,22 @@ from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timedelta
 import uuid
 import math
+import logging
 
 from .database import get_db
 from .models import (
     TenonNode, SensorData, StressResult, HistoryPoint,
     AlertRule, AlertRecord, TopologyData, AlertLevel, AlertType, StressLevel
 )
-from .castigliano import CastiglianoEngine
+from .castigliano import (
+    CastiglianoEngine,
+    CastiglianoCalculationError,
+    InvalidMaterialPropertyError,
+    InvalidGeometryError,
+    NumericalInstabilityError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class NodeService:
@@ -84,27 +93,41 @@ class StressCalculationService:
         node: TenonNode,
         displacement_um: float,
     ) -> Tuple[float, float, str]:
-        shear_force, bending_moment = CastiglianoEngine.force_from_displacement(
-            displacement_um=displacement_um,
-            beam_length=node.beam_length,
-            section_width=node.section_width,
-            section_height=node.section_height,
-            elastic_modulus=node.elastic_modulus,
-            shear_modulus=node.shear_modulus,
-        )
+        try:
+            shear_force, bending_moment = CastiglianoEngine.force_from_displacement(
+                displacement_um=displacement_um,
+                beam_length=node.beam_length,
+                section_width=node.section_width,
+                section_height=node.section_height,
+                elastic_modulus=node.elastic_modulus,
+                shear_modulus=node.shear_modulus,
+            )
+        except CastiglianoCalculationError as e:
+            logger.error(
+                f"Castigliano calculation failed for node {node.id}: {str(e)}",
+                exc_info=True,
+            )
+            raise
 
         rule = AlertService.get_rule(node.id)
-        stress_level = CastiglianoEngine.calculate_stress_level(
-            displacement_um=displacement_um,
-            shear_force=shear_force,
-            bending_moment=bending_moment,
-            displacement_warning=rule.displacement_threshold * 0.6,
-            displacement_danger=rule.displacement_threshold,
-            shear_warning=rule.shear_threshold * 0.6,
-            shear_danger=rule.shear_threshold,
-            moment_warning=rule.moment_threshold * 0.6,
-            moment_danger=rule.moment_threshold,
-        )
+        try:
+            stress_level = CastiglianoEngine.calculate_stress_level(
+                displacement_um=displacement_um,
+                shear_force=shear_force,
+                bending_moment=bending_moment,
+                displacement_warning=rule.displacement_threshold * 0.6,
+                displacement_danger=rule.displacement_threshold,
+                shear_warning=rule.shear_threshold * 0.6,
+                shear_danger=rule.shear_threshold,
+                moment_warning=rule.moment_threshold * 0.6,
+                moment_danger=rule.moment_threshold,
+            )
+        except CastiglianoCalculationError as e:
+            logger.warning(
+                f"Stress level calculation failed for node {node.id}: {str(e)}",
+                exc_info=True,
+            )
+            stress_level = StressLevel.WARNING
 
         return shear_force, bending_moment, stress_level
 
@@ -114,37 +137,76 @@ class DataIngestionService:
     def ingest_sensor_data(data: SensorData) -> Optional[StressResult]:
         node = NodeService.get_node(data.node_id)
         if not node:
+            logger.warning(f"Node {data.node_id} not found for sensor data ingestion")
             return None
 
         timestamp = data.timestamp or datetime.now()
-        shear_force, bending_moment, stress_level = StressCalculationService.calculate_stress(
-            node, data.displacement_um
-        )
 
-        conn = get_db()
-        cursor = conn.cursor()
+        try:
+            shear_force, bending_moment, stress_level = StressCalculationService.calculate_stress(
+                node, data.displacement_um
+            )
+        except CastiglianoCalculationError as e:
+            logger.error(
+                f"Failed to calculate stress for node {data.node_id} "
+                f"with displacement {data.displacement_um}μm: {str(e)}",
+                exc_info=True,
+            )
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE tenon_nodes
+                SET displacement = ?, stress_level = ?, last_update = ?
+                WHERE id = ?
+            """, (
+                data.displacement_um, StressLevel.WARNING.value,
+                timestamp.isoformat(), data.node_id
+            ))
+            conn.commit()
+            conn.close()
+            return None
+        except Exception as e:
+            logger.error(
+                f"Unexpected error calculating stress for node {data.node_id}: {str(e)}",
+                exc_info=True,
+            )
+            return None
 
-        cursor.execute("""
-            UPDATE tenon_nodes
-            SET displacement = ?, shear_force = ?, bending_moment = ?,
-                stress_level = ?, last_update = ?
-            WHERE id = ?
-        """, (
-            data.displacement_um, shear_force, bending_moment,
-            stress_level, timestamp.isoformat(), data.node_id
-        ))
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO displacement_records
-            (node_id, displacement_um, shear_force_n, bending_moment_nm, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            data.node_id, data.displacement_um,
-            shear_force, bending_moment, timestamp.isoformat()
-        ))
+            cursor.execute("""
+                UPDATE tenon_nodes
+                SET displacement = ?, shear_force = ?, bending_moment = ?,
+                    stress_level = ?, last_update = ?
+                WHERE id = ?
+            """, (
+                data.displacement_um, shear_force, bending_moment,
+                stress_level, timestamp.isoformat(), data.node_id
+            ))
 
-        conn.commit()
-        conn.close()
+            cursor.execute("""
+                INSERT INTO displacement_records
+                (node_id, displacement_um, shear_force_n, bending_moment_nm, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                data.node_id, data.displacement_um,
+                shear_force, bending_moment, timestamp.isoformat()
+            ))
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(
+                f"Database error during ingestion for node {data.node_id}: {str(e)}",
+                exc_info=True,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return None
 
         result = StressResult(
             node_id=data.node_id,
@@ -155,17 +217,47 @@ class DataIngestionService:
             timestamp=timestamp,
         )
 
-        AlertService.check_and_create_alerts(node.id, data.displacement_um, shear_force, bending_moment)
+        try:
+            AlertService.check_and_create_alerts(
+                node.id, data.displacement_um, shear_force, bending_moment
+            )
+        except Exception as e:
+            logger.error(
+                f"Alert service failed for node {data.node_id}: {str(e)}",
+                exc_info=True,
+            )
 
         return result
 
     @staticmethod
     def ingest_batch(data_list: List[SensorData]) -> List[StressResult]:
         results = []
-        for data in data_list:
-            result = DataIngestionService.ingest_sensor_data(data)
-            if result:
-                results.append(result)
+        errors = []
+
+        for idx, data in enumerate(data_list):
+            try:
+                result = DataIngestionService.ingest_sensor_data(data)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                error_msg = (
+                    f"Batch ingestion failed for index {idx}, "
+                    f"node {data.node_id}: {str(e)}"
+                )
+                logger.error(error_msg, exc_info=True)
+                errors.append({
+                    "index": idx,
+                    "node_id": data.node_id,
+                    "error": str(e),
+                })
+                continue
+
+        if errors:
+            logger.warning(
+                f"Batch ingestion completed with {len(errors)} errors out of "
+                f"{len(data_list)} items. First error: {errors[0] if errors else 'none'}"
+            )
+
         return results
 
 
